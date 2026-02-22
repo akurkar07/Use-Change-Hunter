@@ -1,38 +1,35 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import sessionmaker
+"""Database session management and dependency injection."""
+from typing import AsyncGenerator
 
-from app.core.config import settings
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
-# SQLAlchemy async engine
+from app.core.config import get_settings
+
+settings = get_settings()
+
+# Create async engine
 engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-    future=True
+    settings.database_url,
+    echo=settings.DEBUG,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
 )
 
-# Async session factory
-async_session_maker = async_sessionmaker(
+# Create async session factory
+AsyncSessionLocal = async_sessionmaker(
     engine,
     class_=AsyncSession,
     expire_on_commit=False,
+    autoflush=False,
     autocommit=False,
-    autoflush=False
 )
 
 
-async def get_db() -> AsyncSession:
-    """
-    Dependency injection for database sessions in FastAPI routes
-    
-    Usage:
-        async def my_route(db: AsyncSession = Depends(get_db)):
-            ...
-    """
-    async with async_session_maker() as session:
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Dependency injection for database session."""
+    async with AsyncSessionLocal() as session:
         try:
             yield session
-        except Exception:
-            await session.rollback()
-            raise
         finally:
             await session.close()

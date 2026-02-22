@@ -1,85 +1,204 @@
-from typing import Any, Dict, Optional
+"""Financial scenario modeling service."""
+from typing import Optional
 
-from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
-
-def model_financial_scenario(parameters: Dict[str, Any]) -> Dict[str, Any]:
-    build_cost = float(parameters.get("build_cost", 0))
-    contingency_pct = float(parameters.get("contingency_pct", 10))
-    professional_fees_pct = float(parameters.get("professional_fees_pct", 8))
-    finance_cost = float(parameters.get("finance_cost", 0))
-    buy_price = float(parameters.get("buy_price", 0))
-    stamp_legal = float(parameters.get("stamp_legal", 0))
-    gdv = float(parameters.get("gdv", 0))
-    annual_rent_uplift = float(parameters.get("annual_rent_uplift", 0))
-    hold_years = float(parameters.get("hold_years", 1))
-    risk_haircut_pct = float(parameters.get("risk_haircut_pct", 15))
-
-    contingency = build_cost * contingency_pct / 100.0
-    professional_fees = build_cost * professional_fees_pct / 100.0
-    total_cost = buy_price + stamp_legal + build_cost + contingency + professional_fees + finance_cost
-    gross_profit = gdv - total_cost
-    rental_uplift_value = annual_rent_uplift * hold_years
-    risk_adjusted_profit = gross_profit * (1.0 - (risk_haircut_pct / 100.0))
-
-    return {
-        "inputs": {
-            "build_cost": build_cost,
-            "contingency_pct": contingency_pct,
-            "professional_fees_pct": professional_fees_pct,
-            "finance_cost": finance_cost,
-            "buy_price": buy_price,
-            "stamp_legal": stamp_legal,
-            "gdv": gdv,
-            "annual_rent_uplift": annual_rent_uplift,
-            "hold_years": hold_years,
-            "risk_haircut_pct": risk_haircut_pct,
-        },
-        "outputs": {
-            "contingency": round(contingency, 2),
-            "professional_fees": round(professional_fees, 2),
-            "total_cost": round(total_cost, 2),
-            "gross_profit": round(gross_profit, 2),
-            "rental_uplift_value": round(rental_uplift_value, 2),
-            "risk_adjusted_profit": round(risk_adjusted_profit, 2),
-            "gross_margin_pct": round((gross_profit / total_cost) * 100, 2) if total_cost > 0 else 0.0,
-        },
-        "explanation": [
-            "Financial model uses explicit assumptions only.",
-            "Risk-adjusted profit applies a simple haircut to gross profit.",
-        ],
-    }
+from app.schemas.schemas import ScenarioBreakdown
 
 
-async def create_scenario(
-    property_id: str,
-    db: AsyncSession,
-    parameters: Dict[str, Any],
-) -> Optional[dict]:
-    logger.info(f"Creating scenario for property {property_id}")
-    return model_financial_scenario(parameters)
+class ScenarioService:
+    """Service for financial scenario modeling and analysis."""
+
+    # Base assumptions for calculations
+    PROPERTY_BASE_VALUE = 350000  # Default UK property value
+    VALUE_UPLIFT_MULTIPLIER = 1.3  # 30% uplift from development
+    LTV_RATIO = 0.7  # 70% loan to value
+    SOFT_COSTS_RATIO = 0.15  # 15% of dev cost for soft costs
+
+    def __init__(self):
+        """Initialize scenario service."""
+        pass
+
+    def calculate_scenario_breakdown(
+        self,
+        development_cost: float,
+        holding_period_months: int,
+        finance_type: str = "cash",
+        finance_rate: float = 0.0,
+        property_value: float = PROPERTY_BASE_VALUE,
+    ) -> ScenarioBreakdown:
+        """
+        Calculate financial breakdown for a development scenario.
+
+        Args:
+            development_cost: Estimated development cost in £
+            holding_period_months: How long to hold the property
+            finance_type: Type of financing (cash, btl_mortgage, development_loan)
+            finance_rate: Annual interest rate (as decimal, e.g. 0.05 for 5%)
+            property_value: Base property purchase value
+
+        Returns:
+            ScenarioBreakdown with detailed calculations
+        """
+        # Calculate ARV with value uplift
+        estimated_uplift = development_cost * (self.VALUE_UPLIFT_MULTIPLIER - 1)
+        estimated_arv = property_value + estimated_uplift
+
+        # Calculate financing costs
+        financing_cost = self._calculate_financing_cost(
+            development_cost,
+            holding_period_months,
+            finance_type,
+            finance_rate,
+        )
+
+        # Calculate soft costs
+        soft_costs = development_cost * self.SOFT_COSTS_RATIO
+
+        # Total costs
+        total_cost = development_cost + financing_cost + soft_costs
+
+        # Calculate profit
+        estimated_profit = estimated_arv - property_value - total_cost
+
+        # ROI percentage
+        roi_percent = (estimated_profit / (property_value + development_cost)) * 100
+
+        return ScenarioBreakdown(
+            estimated_arv=round(estimated_arv, 2),
+            estimated_cost=round(total_cost, 2),
+            estimated_profit=round(estimated_profit, 2),
+            roi_percent=round(roi_percent, 2),
+            holding_months=holding_period_months,
+            financing_cost=round(financing_cost, 2),
+        )
+
+    def _calculate_financing_cost(
+        self,
+        development_cost: float,
+        holding_period_months: int,
+        finance_type: str,
+        finance_rate: float,
+    ) -> float:
+        """Calculate financing costs based on type and rate."""
+        if finance_type == "cash":
+            return 0  # No financing cost for cash
+
+        # Calculate financed amount
+        if finance_type == "btl_mortgage":
+            # BTL: typically 70-75% LTV
+            financed_amount = development_cost * 0.7
+        elif finance_type == "development_loan":
+            # Development loan: typically 60-70% of costs
+            financed_amount = development_cost * 0.65
+        else:
+            financed_amount = development_cost * self.LTV_RATIO
+
+        # Monthly interest calculation
+        monthly_rate = finance_rate / 12
+        monthly_interest = financed_amount * monthly_rate
+        total_financing_cost = monthly_interest * holding_period_months
+
+        return total_financing_cost
+
+    def rank_scenarios(
+        self,
+        scenarios: list[dict],
+        metric: str = "roi_percent",
+    ) -> list[dict]:
+        """
+        Rank scenarios by a given metric.
+
+        Args:
+            scenarios: List of scenario dictionaries
+            metric: Metric to rank by (roi_percent, estimated_profit, etc)
+
+        Returns:
+            Sorted scenarios
+        """
+        return sorted(
+            scenarios,
+            key=lambda s: s.get(metric, 0),
+            reverse=True,
+        )
+
+    def compare_scenarios(
+        self,
+        scenarios: list[dict],
+    ) -> dict:
+        """
+        Compare multiple scenarios and provide recommendation.
+
+        Args:
+            scenarios: List of scenario dictionaries
+
+        Returns:
+            Comparison analysis
+        """
+        if not scenarios:
+            return {}
+
+        highest_roi = max(scenarios, key=lambda s: s.get("roi_percent", 0))
+        highest_profit = max(scenarios, key=lambda s: s.get("estimated_profit", 0))
+        lowest_risk = min(scenarios, key=lambda s: s.get("estimated_cost", float("inf")))
+
+        return {
+            "best_roi": highest_roi,
+            "best_profit": highest_profit,
+            "lowest_cost": lowest_risk,
+            "scenarios_count": len(scenarios),
+            "average_roi": sum(s.get("roi_percent", 0) for s in scenarios) / len(scenarios),
+        }
+
+    def calculate_payback_period(
+        self,
+        estimated_profit: float,
+        estimated_cost: float,
+        monthly_cash_flow: float = 0,
+    ) -> dict:
+        """
+        Calculate payback period for investment.
+
+        Args:
+            estimated_profit: Total estimated profit
+            estimated_cost: Total development cost
+            monthly_cash_flow: Monthly income during holding period
+
+        Returns:
+            Payback period analysis
+        """
+        if monthly_cash_flow <= 0:
+            # No cash flow, payback is when property sells (at end of holding period)
+            return {
+                "payback_months": None,
+                "payback_type": "upon_sale",
+                "notes": "Returns realized upon sale",
+            }
+
+        monthly_net_return = monthly_cash_flow - (estimated_cost / 24)  # Amortize over 2 years
+        if monthly_net_return <= 0:
+            return {
+                "payback_months": None,
+                "payback_type": "negative",
+                "notes": "Negative cash flow - not recommended",
+            }
+
+        payback_months = estimated_cost / monthly_net_return
+
+        return {
+            "payback_months": round(payback_months, 1),
+            "payback_type": "ongoing",
+            "notes": f"Breaks even in {round(payback_months, 1)} months",
+        }
 
 
-async def compare_scenarios(
-    property_id: str,
-    db: AsyncSession,
-    scenario_list: list,
-) -> Optional[Dict[str, Any]]:
-    logger.info(f"Comparing {len(scenario_list)} scenarios for property {property_id}")
-    return {
-        f"scenario_{idx}": model_financial_scenario(params)
-        for idx, params in enumerate(scenario_list)
-    }
+# Singleton instance
+_scenario_service: Optional[ScenarioService] = None
 
 
-async def optimize_scenario(
-    property_id: str,
-    db: AsyncSession,
-    optimization_objective: str = "roi",
-) -> Optional[dict]:
-    logger.info(f"Optimizing scenario for property {property_id} (objective={optimization_objective})")
-    return {
-        "objective": optimization_objective,
-        "message": "MVP optimizer not enabled yet; use compare_scenarios for explicit options.",
-    }
+def get_scenario_service() -> ScenarioService:
+    """Get or create scenario service singleton."""
+    global _scenario_service
+    if _scenario_service is None:
+        _scenario_service = ScenarioService()
+    return _scenario_service

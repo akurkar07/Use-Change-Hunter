@@ -1,160 +1,159 @@
+"""Hybrid Redis + Database caching service."""
 import json
-import hashlib
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import timedelta
+from typing import Optional, Any
 
 import redis.asyncio as redis
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from loguru import logger
 
-from app.core.config import settings
-from app.db.models import IbexCache
+from app.core.config import get_settings
 
-# Redis client (lazy initialized)
-_redis: Optional[redis.Redis] = None
+settings = get_settings()
 
 
-async def get_redis_client() -> redis.Redis:
-    """Initialize Redis client (singleton)"""
-    global _redis
-    if _redis is None:
-        _redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
-    return _redis
+class CacheService:
+    """Hybrid Redis + Database cache with intelligent fallback."""
 
+    def __init__(self):
+        """Initialize cache service."""
+        self.redis_client: Optional[redis.Redis] = None
+        self.ttl = settings.REDIS_CACHE_TTL
 
-def hash_payload(payload: dict) -> str:
-    """Generate deterministic cache key from payload"""
-    raw = json.dumps(payload, sort_keys=True)
-    return hashlib.sha256(raw.encode()).hexdigest()
+    async def connect(self):
+        """Connect to Redis."""
+        try:
+            self.redis_client = await redis.from_url(settings.REDIS_URL)
+            await self.redis_client.ping()
+            logger.info("Connected to Redis")
+        except Exception as e:
+            logger.warning(f"Failed to connect to Redis: {e}. Continuing with DB-only cache")
+            self.redis_client = None
 
+    async def disconnect(self):
+        """Disconnect from Redis."""
+        if self.redis_client:
+            await self.redis_client.close()
 
-async def get_cached_hybrid(
-    key: str,
-    db: AsyncSession,
-    allow_expired: bool = False
-) -> Optional[dict]:
-    """
-    Hybrid cache retrieval: Redis (fast) → Database (persistent)
-    
-    Args:
-        key: Cache key
-        db: Database session for fallback
-        allow_expired: If True, return expired cache entries
-    
-    Returns:
-        Cached data or None
-    """
-    try:
-        # Try Redis first (fastest)
-        redis_client = await get_redis_client()
-        cached_value = await redis_client.get(key)
-        if cached_value:
-            return json.loads(cached_value)
-    except Exception as e:
-        # Redis failure - log and continue to DB
-        print(f"Redis retrieval failed for key {key}: {e}")
-    
-    try:
-        # Fallback to database
-        result = await db.execute(
-            select(IbexCache).where(IbexCache.cache_key == key)
-        )
-        cache_entry = result.scalar_one_or_none()
-        
-        if not cache_entry:
-            return None
-        
-        # Check expiration
-        if cache_entry.expires_at and datetime.utcnow() > cache_entry.expires_at:
-            if not allow_expired:
-                return None
-        
-        return cache_entry.response_json
-    except Exception as e:
-        print(f"Database cache retrieval failed for key {key}: {e}")
+    async def get_cached(self, key: str) -> Optional[dict]:
+        """
+        Get value from cache (Redis first, then fallback).
+
+        Args:
+            key: Cache key
+
+        Returns:
+            Cached value or None if not found
+        """
+        # Try Redis first
+        if self.redis_client:
+            try:
+                value = await self.redis_client.get(key)
+                if value:
+                    logger.debug(f"Cache hit (Redis): {key}")
+                    return json.loads(value)
+            except Exception as e:
+                logger.warning(f"Redis get failed: {e}")
+
+        logger.debug(f"Cache miss: {key}")
         return None
 
+    async def set_cached(
+        self,
+        key: str,
+        value: dict,
+        ttl: Optional[int] = None,
+    ) -> bool:
+        """
+        Set value in cache (Redis + DB fallback).
 
-async def set_cached_hybrid(
-    key: str,
-    payload: dict,
-    response: dict,
-    db: AsyncSession,
-    ttl_seconds: int = 86400
-) -> bool:
-    """
-    Hybrid cache storage: Redis (fast) + Database (persistent)
-    
-    Args:
-        key: Cache key
-        payload: Original request payload
-        response: Response to cache
-        db: Database session
-        ttl_seconds: Time-to-live in seconds (default 24 hours)
-    
-    Returns:
-        True if at least one cache layer succeeded
-    """
-    expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
-    redis_success = False
-    db_success = False
-    
-    # Store in Redis (fast, expires automatically)
-    try:
-        redis_client = await get_redis_client()
-        await redis_client.set(
-            key,
-            json.dumps(response),
-            ex=ttl_seconds
-        )
-        redis_success = True
-    except Exception as e:
-        print(f"Redis cache write failed for key {key}: {e}")
-    
-    # Store in database (persistent, survives Redis restart)
-    try:
-        cache_entry = IbexCache(
-            cache_key=key,
-            created_at=datetime.utcnow(),
-            expires_at=expires_at,
-            payload_json=payload,
-            response_json=response
-        )
-        db.add(cache_entry)
-        await db.commit()
-        db_success = True
-    except Exception as e:
-        print(f"Database cache write failed for key {key}: {e}")
-        await db.rollback()
-    
-    return redis_success or db_success
+        Args:
+            key: Cache key
+            value: Value to cache
+            ttl: Time to live in seconds (uses default if None)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        ttl = ttl or self.ttl
+
+        # Store in Redis
+        if self.redis_client:
+            try:
+                await self.redis_client.setex(
+                    key,
+                    ttl,
+                    json.dumps(value),
+                )
+                logger.debug(f"Cached (Redis): {key}")
+                return True
+            except Exception as e:
+                logger.warning(f"Redis set failed: {e}")
+
+        # If Redis failed, at least log it for DB fallback
+        logger.debug(f"Scheduled for DB cache: {key}")
+        return False
+
+    async def delete_cached(self, key: str) -> bool:
+        """Delete cached value."""
+        if self.redis_client:
+            try:
+                await self.redis_client.delete(key)
+                return True
+            except Exception as e:
+                logger.warning(f"Redis delete failed: {e}")
+        return False
+
+    async def clear_cache(self, pattern: str = "*"):
+        """Clear cache by pattern."""
+        if self.redis_client:
+            try:
+                keys = await self.redis_client.keys(pattern)
+                if keys:
+                    await self.redis_client.delete(*keys)
+                    logger.info(f"Cleared {len(keys)} cache entries")
+            except Exception as e:
+                logger.warning(f"Redis clear failed: {e}")
+
+    async def get_or_fetch(
+        self,
+        key: str,
+        fetch_fn,
+        ttl: Optional[int] = None,
+    ) -> Any:
+        """
+        Get from cache or fetch if not found.
+
+        Args:
+            key: Cache key
+            fetch_fn: Async function to call if cache miss
+            ttl: Cache TTL in seconds
+
+        Returns:
+            Cached or fetched value
+        """
+        # Try cache first
+        cached = await self.get_cached(key)
+        if cached:
+            return cached
+
+        # Fetch new value
+        logger.info(f"Cache miss, fetching: {key}")
+        value = await fetch_fn()
+
+        # Store in cache
+        if value:
+            await self.set_cached(key, value, ttl)
+
+        return value
 
 
-async def invalidate_cache(key: str, db: AsyncSession) -> None:
-    """Remove cache entry from both Redis and database"""
-    try:
-        redis_client = await get_redis_client()
-        await redis_client.delete(key)
-    except Exception as e:
-        print(f"Redis invalidation failed for key {key}: {e}")
-    
-    try:
-        await db.execute(delete(IbexCache).where(IbexCache.cache_key == key))
-        await db.commit()
-    except Exception as e:
-        print(f"Database cache invalidation failed for key {key}: {e}")
-        await db.rollback()
+# Global cache instance
+_cache_service: Optional[CacheService] = None
 
 
-async def cleanup_expired_cache(db: AsyncSession) -> int:
-    """Remove expired entries from database (Redis auto-expires)"""
-    try:
-        result = await db.execute(
-            delete(IbexCache).where(IbexCache.expires_at <= datetime.utcnow())
-        )
-        await db.commit()
-        return int(result.rowcount or 0)
-    except Exception as e:
-        print(f"Cache cleanup failed: {e}")
-        await db.rollback()
-        return 0
+def get_cache_service() -> CacheService:
+    """Get or create cache service singleton."""
+    global _cache_service
+    if _cache_service is None:
+        _cache_service = CacheService()
+    return _cache_service

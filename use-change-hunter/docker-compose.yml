@@ -4,7 +4,8 @@ services:
   postgres:
     image: postgres:15
     environment:
-      POSTGRES_DATABASE: use_change_hunter
+      POSTGRES_DB: use_change_hunter
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     volumes:
       - postgres_data:/var/lib/postgresql/data

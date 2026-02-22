@@ -1,9 +1,10 @@
 from typing import Optional
 from datetime import datetime
 from io import BytesIO
-import json
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from loguru import logger
 
 try:
@@ -41,10 +42,15 @@ async def export_analysis_data(
     logger.info(f"Retrieving analysis data for property {property_id}")
     
     try:
+        prop_uuid = UUID(property_id)
+
         # Get all scores for this property
-        scores = await db.query(OpportunityScore).filter(
-            OpportunityScore.property_id == property_id
-        ).all()
+        result = await db.execute(
+            select(OpportunityScore)
+            .where(OpportunityScore.property_id == prop_uuid)
+            .order_by(OpportunityScore.generated_at.desc())
+        )
+        scores = result.scalars().all()
         
         if not scores:
             logger.warning(f"No analysis data found for property {property_id}")

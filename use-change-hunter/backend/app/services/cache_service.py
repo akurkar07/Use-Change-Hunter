@@ -5,6 +5,7 @@ from typing import Optional
 
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete
 
 from app.core.config import settings
 from app.db.models import IbexCache
@@ -17,7 +18,7 @@ async def get_redis_client() -> redis.Redis:
     """Initialize Redis client (singleton)"""
     global _redis
     if _redis is None:
-        _redis = await redis.from_url(settings.REDIS_URL, decode_responses=True)
+        _redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
     return _redis
 
 
@@ -55,9 +56,10 @@ async def get_cached_hybrid(
     
     try:
         # Fallback to database
-        cache_entry = await db.query(IbexCache).filter(
-            IbexCache.cache_key == key
-        ).first()
+        result = await db.execute(
+            select(IbexCache).where(IbexCache.cache_key == key)
+        )
+        cache_entry = result.scalar_one_or_none()
         
         if not cache_entry:
             return None
@@ -137,7 +139,7 @@ async def invalidate_cache(key: str, db: AsyncSession) -> None:
         print(f"Redis invalidation failed for key {key}: {e}")
     
     try:
-        await db.query(IbexCache).filter(IbexCache.cache_key == key).delete()
+        await db.execute(delete(IbexCache).where(IbexCache.cache_key == key))
         await db.commit()
     except Exception as e:
         print(f"Database cache invalidation failed for key {key}: {e}")
@@ -147,11 +149,11 @@ async def invalidate_cache(key: str, db: AsyncSession) -> None:
 async def cleanup_expired_cache(db: AsyncSession) -> int:
     """Remove expired entries from database (Redis auto-expires)"""
     try:
-        result = await db.query(IbexCache).filter(
-            IbexCache.expires_at <= datetime.utcnow()
-        ).delete()
+        result = await db.execute(
+            delete(IbexCache).where(IbexCache.expires_at <= datetime.utcnow())
+        )
         await db.commit()
-        return result
+        return int(result.rowcount or 0)
     except Exception as e:
         print(f"Cache cleanup failed: {e}")
         await db.rollback()
